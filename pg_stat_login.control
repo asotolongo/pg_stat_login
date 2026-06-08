@@ -1,0 +1,5 @@
+comment = 'Track PostgreSQL login statistics using the Custom Cumulative Stats API (PG18+)'
+default_version = '1.0'
+module_pathname = '$libdir/pg_stat_login'
+relocatable = false
+superuser = true

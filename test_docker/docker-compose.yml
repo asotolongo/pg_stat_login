@@ -1,0 +1,24 @@
+services:
+  postgres:
+    build:
+      context: ..         # extension root (pg_stat_login/)
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: testdb
+    ports:
+      - "5432:5432"
+    command: >
+      postgres
+        -c shared_preload_libraries='pg_stat_login'
+        -c hba_file=/etc/postgresql/pg_hba.conf
+        -c log_connections=on
+        -c log_disconnections=on
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./init.sql:/docker-entrypoint-initdb.d/10_pg_stat_login.sql:ro
+
+volumes:
+  pgdata:

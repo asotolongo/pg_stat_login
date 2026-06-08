@@ -1,0 +1,104 @@
+pg_stat_login/
+├── pg_stat_login.c          ← CCS API, PG18+ only
+├── pg_stat_login.control
+├── pg_stat_login--1.0.sql
+├── pg_stat_login.conf       ← para make check
+├── Makefile
+├── README.md
+├── Dockerfile               ← postgres:18
+├── .dockerignore
+├── sql/
+│   └── pg_stat_login.sql    ← tests de regresión
+├── expected/
+│   └── pg_stat_login.out    ← expected output
+└── test_docker/
+    ├── docker-compose.yml
+    ├── pg_hba.conf
+    ├── init.sql
+    └── README.md
+Diferencias clave vs pg_login_stat:
+
+pg_login_stat	pg_stat_login
+API	ShmemInitHash manual	pgstat_register_kind (CCS)
+Persistencia	❌ se pierde al reiniciar	✅ sobrevive reinicios limpios
+Versión mínima	PG15+	PG18+
+Shmem hooks	shmem_request_hook + shmem_startup_hook	Solo shmem_startup_hook (tranche)
+Reset	Itera y borra entradas del HTAB	pgstat_reset_of_kind() → reset_all_cb
+Lectura	LWLock shared + spinlock	pgstat_snapshot_fixed() → sin lock
+
+
+
+
+
+pg_stat_login_info() — para qué sirve
+Es una función de monitoreo de la salud del hash table, no de las estadísticas de logins en sí. Retorna:
+
+Campo	Qué indica
+max_entries	Cuántos pares (user, db) puede almacenar como máximo (= pg_stat_login.max_entries)
+num_entries	Cuántos hay registrados ahora mismo
+n_dropped	Cuántos eventos de login se descartaron porque la tabla estaba llena
+stats_reset	Cuándo se resetaron las estadísticas por última vez
+El campo crítico es n_dropped. Si crece, significa que max_entries es demasiado pequeño para tu carga y hay logins que no se están contando. Es la señal para hacer:
+
+
+ALTER SYSTEM SET pg_stat_login.max_entries = 5000;
+-- (requiere reinicio)
+Otras extensiones con esa estructura
+Sí, pg_stat_log de Fabrizio tiene exactamente la misma función — de hecho de ahí tomé el patrón:
+
+
+/* pg_stat_log_info() — en pg_stat_log.c */
+Datum pg_stat_log_info(PG_FUNCTION_ARGS)
+{
+    /* retorna: max_entries, num_entries, n_dropped, stats_reset */
+}
+Y también pg_stat_statements tiene algo análogo: pg_stat_statements_info() que retorna dealloc (cuántas entradas fueron descartadas por overflow) y stats_reset. Es el mismo concepto: darle al DBA visibilidad sobre si el buffer se está llenando.
+
+En esencia es el patrón estándar para cualquier extensión que tenga un hash table de tamaño fijo: siempre necesitas una función de "metainfo" que exponga la presión sobre esa tabla.
+
+pg_stat_login.c#60-60
+pero no podre poner a 5000 (pg_stat_login.max_entries) , porque esa definido a 1000 como maximo
+
+PGSTAT_LOGIN_MAX_DEFAULT   1000
+The user is confused about PGSTAT_LOGIN_MAX_DEFAULT. They think it's a maximum, but it's actually the default value. The maximum is INT_MAX / 2 as defined in the DefineCustomIntVariable call. Let me clarify this.
+
+Looking at the code:
+
+
+#define PGSTAT_LOGIN_MAX_DEFAULT   1000
+
+DefineCustomIntVariable("pg_stat_login.max_entries",
+                        "Maximum number of (user, database) pairs to track.",
+                        NULL,
+                        &pls_max,
+                        PGSTAT_LOGIN_MAX_DEFAULT,  // default = 1000
+                        PGSTAT_LOGIN_MIN_ENTRIES,   // min = 100
+                        INT_MAX / 2,                // max = ~1 billion
+                        PGC_POSTMASTER,
+                        0,
+                        NULL,
+                        NULL,
+                        NULL);
+So PGSTAT_LOGIN_MAX_DEFAULT is the default value (1000), not the maximum allowed value. The maximum is INT_MAX / 2 (~1 billion). The user can set it to 5000 or any value up to INT_MAX/2.
+
+The naming is a bit confusing - MAX_DEFAULT means "the default for the max_entries parameter," not "the maximum value allowed."
+
+No hay problema — PGSTAT_LOGIN_MAX_DEFAULT es el valor por defecto, no el máximo permitido. El nombre puede confundir, pero significa "el valor predeterminado del parámetro max_entries".
+
+El máximo real está en DefineCustomIntVariable:
+
+
+DefineCustomIntVariable("pg_stat_login.max_entries",
+                        ...
+                        &pls_max,
+                        PGSTAT_LOGIN_MAX_DEFAULT,  // default  = 1000
+                        PGSTAT_LOGIN_MIN_ENTRIES,   // mínimo   = 100
+                        INT_MAX / 2,                // máximo   = ~1.07 mil millones
+                        ...);
+Así que perfectamente puedes poner:
+
+
+ALTER SYSTEM SET pg_stat_login.max_entries = 5000;
+y reiniciar. PostgreSQL lo acepta porque el límite real es INT_MAX / 2. El 1000 es solo con qué valor arranca si no configuras nada.
+
+El mismo patrón que usamos antes en pg_login_stat — y el mismo que usa pg_stat_statements con pg_stat_statements.max (default 5000, pero puedes subirlo mucho más).
