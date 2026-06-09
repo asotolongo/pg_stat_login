@@ -39,6 +39,7 @@
 #include "utils/guc.h"
 #include "utils/pgstat_internal.h"
 #include "utils/timestamp.h"
+#include "utils/tuplestore.h"
 
 PG_MODULE_MAGIC_EXT(
 	.name = "pg_stat_login",
@@ -172,7 +173,11 @@ pls_init_shmem_cb(void *stats)
 	PlsSharedBlock *shmem = (PlsSharedBlock *) stats;
 	PlsData        *s;
 
+#if PG_VERSION_NUM >= 190000
+	LWLockInitialize(&shmem->lock, LWLockNewTrancheId(PGSTAT_LOGIN_TRANCHE_NAME));
+#else
 	LWLockInitialize(&shmem->lock, LWLockNewTrancheId());
+#endif
 	shmem->changecount = 0;
 	shmem->stats_reset = GetCurrentTimestamp();
 	shmem->n_dropped   = 0;
@@ -265,13 +270,15 @@ pls_snapshot_cb(void)
 static void
 pls_shmem_startup(void)
 {
-	PlsSharedBlock *shmem;
-
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
 
-	shmem = (PlsSharedBlock *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOGIN);
-	LWLockRegisterTranche(shmem->lock.tranche, PGSTAT_LOGIN_TRANCHE_NAME);
+#if PG_VERSION_NUM < 190000
+	{
+		PlsSharedBlock *shmem = (PlsSharedBlock *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOGIN);
+		LWLockRegisterTranche(shmem->lock.tranche, PGSTAT_LOGIN_TRANCHE_NAME);
+	}
+#endif
 }
 
 /*
