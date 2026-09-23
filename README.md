@@ -157,7 +157,7 @@ See [`test_docker/`](test_docker/) for a ready-to-use PostgreSQL 18 environment.
 
 
 ## AI help
-I received some help from Claude Code for coding some parts of the extension
+I received some help from Claude Code for coding some parts of the extension following my instructions
 
 ## Special thanks
 To Fabrízio de Royes Mello for his suggestion about to follow the custom cumulative statistics API and his extension [pg_stat_log](https://github.com/fabriziomello/pg_stat_log/), I tried to copy some of his ideas.
