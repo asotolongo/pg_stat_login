@@ -56,7 +56,9 @@ CREATE EXTENSION pg_stat_login;
 | Parameter | Type | Default | Context | Description |
 |---|---|---|---|---|
 | `pg_stat_login.enable` | bool | `on` | SIGHUP | Enable/disable collection; changeable at runtime via `pg_reload_conf()` |
-| `pg_stat_login.max_entries` | int | `1000` | Postmaster | Maximum `(user, database)` pairs tracked; requires server restart |
+
+The extension tracks up to **10000** `(user, database)` pairs. This limit is fixed
+and cannot be configured.
 
 ## Usage
 
@@ -107,12 +109,15 @@ SELECT * FROM pg_stat_login_info();
 
 | Column | Type | Description |
 |---|---|---|
-| `max_entries` | int | Configured `pg_stat_login.max_entries` |
+| `max_entries` | int | Maximum pairs tracked (always 10000) |
 | `num_entries` | int | Distinct `(user, database)` pairs currently tracked |
-| `n_dropped` | bigint | Login events dropped because `max_entries` was full |
-| `stats_reset` | timestamptz | Timestamp of last reset or server startup |
+| `n_dropped` | bigint | Login events dropped because the table was full, since the last reset |
+| `stats_reset` | timestamptz | Timestamp of the last reset; it is also set when the statistics start empty, for example on first start or after crash recovery |
 
-If `n_dropped` grows, increase `pg_stat_login.max_entries` and restart.
+If `n_dropped` grows, the table is full: new `(user, database)` pairs are not
+tracked until `pg_stat_login_reset()` is called, while pairs already in the table
+keep being counted. Failed logins also take up entries, so `n_dropped` growing
+quickly can indicate login attempts with many different user or database names.
 
 ### Reset statistics
 
@@ -138,9 +143,6 @@ Statistics survive **clean** PostgreSQL restarts (the CCS API serializes the
 stats block to `$PGDATA/pg_stat/` on shutdown). They are discarded after crash
 recovery, which follows standard PostgreSQL cumulative stats semantics.
 
-If `pg_stat_login.max_entries` is changed between restarts, the persisted block
-is discarded (logged as a WARNING) and collection can restarts from zero.
-
 ## Stats kind ID
 
 This extension uses custom stats kind ID **30**, registered at
@@ -149,11 +151,29 @@ https://wiki.postgresql.org/wiki/CustomCumulativeStats.
 
 ## Notes
 
-- Failed logins include wrong passwords, `pg_hba.conf` rejections, and any other authentication error and some time can count double due to [The SSL mode behavior in authentication-hooked extensions](https://ongres.com/blog/ssl_mode_behavior_in_authentication_hooked_extensions/)
+- Failed logins include wrong passwords and other errors reported by the authentication method, and some time can count double due to [The SSL mode behavior in authentication-hooked extensions](https://ongres.com/blog/ssl_mode_behavior_in_authentication_hooked_extensions/)
+- A client that closes the connection when asked for a password is **not counted**. `psql` and other libpq clients do this before prompting for the password and reconnecting, so counting it would report a false failure.
+- Names are stored as the client sends them. A name that is not valid in the encoding of the database being queried is shown with its bytes escaped as `\xHH`, and in `SQL_ASCII` databases every non-ASCII byte is escaped. A valid name that the client encoding cannot represent still makes the query fail with `has no equivalent in encoding`, until `pg_stat_login_reset()` is called.
+- Connections rejected before the `ClientAuthentication_hook` runs are **not counted** in `login_ok`, `login_fail` or `n_dropped`:
+  - `sorry, too many clients already`, when all connection slots are in use. These rejections can be found in the server log.
+  - `pg_hba.conf` rejections: a `reject` rule or no matching entry.
+- Connections rejected after a successful authentication are **counted as `login_ok`**, because the hook has already run:
+  - `remaining connection slots are reserved`, when a role without the required privileges gets only reserved slots.
+  - A database that does not exist, when the credentials are valid.
+  - A role that does not exist, with a method that does not verify credentials (for example `trust`).
+- `login_ok` therefore means that authentication passed, not that a session was opened. Names are stored as received, without checking the catalog, so a role or database that does not exist gets its own row and takes up an entry. To find them, compare the rows with `pg_roles` and `pg_database`.
+
+  | Attempt | `scram-sha-256` | `trust` |
+  |---|---|---|
+  | Role does not exist | `login_fail` | `login_ok` |
+  | Database does not exist, valid password | `login_ok` | `login_ok` |
+  | Database does not exist, wrong password | `login_fail` | `login_ok` |
+  | Neither role nor database exist | `login_fail` | `login_ok` |
 
 ## Docker test environment
 
 See [`test_docker/`](test_docker/) for a ready-to-use PostgreSQL 18 environment.
+See [`test_docker19rc1/`](test_docker19rc1/) for the same environment on PostgreSQL 19 RC1.
 
 
 ## AI help

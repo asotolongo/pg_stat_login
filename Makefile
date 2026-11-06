@@ -5,7 +5,7 @@ EXTENSION = pg_stat_login
 DATA      = pg_stat_login--1.0.sql
 PGFILEDESC = "pg_stat_login - login statistics via Custom Cumulative Stats API (PG18+)"
 
-REGRESS      = pg_stat_login
+REGRESS      = pg_stat_login pg_stat_login_capacity
 REGRESS_OPTS = --temp-config=./pg_stat_login.conf \
                --temp-instance=./tmp_check
 

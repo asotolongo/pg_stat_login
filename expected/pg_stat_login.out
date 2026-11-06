@@ -69,7 +69,7 @@ SELECT username, datname, login_ok, login_fail FROM pg_stat_logins where usernam
 SELECT max_entries,num_entries,n_dropped FROM pg_stat_login_info();
  max_entries | num_entries | n_dropped 
 -------------+-------------+-----------
-         200 |           3 |         0
+       10000 |           3 |         0
 (1 row)
 
 --

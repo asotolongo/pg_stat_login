@@ -113,10 +113,11 @@ SELECT * FROM pg_stat_login_info();
 ```
  max_entries | num_entries | n_dropped |          stats_reset
 -------------+-------------+-----------+-------------------------------
-        1000 |           3 |         0 | 2026-06-03 12:00:00.000000+00
+       10000 |           3 |         0 | 2026-06-03 12:00:00.000000+00
 ```
 
-`n_dropped > 0` means `max_entries` is too small — increase it and restart.
+`n_dropped > 0` means the table is full: new `(user, database)` pairs are not
+tracked until `pg_stat_login_reset()` is called.
 
 ### Reset statistics
 
@@ -155,4 +156,13 @@ SELECT pg_reload_conf();
 
 ```bash
 docker compose logs -f
+```
+
+### Connect to container
+
+```bash
+#bash
+docker compose exec postgres bash
+#psql
+docker compose exec postgres psql -U postgres
 ```

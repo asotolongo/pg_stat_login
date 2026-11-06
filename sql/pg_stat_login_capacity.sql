@@ -1,0 +1,215 @@
+-- Capacity and limits of pg_stat_login: several entries, a full table and
+-- connection slot exhaustion. Runs after pg_stat_login, which disables the
+-- collection and leaves the tester role behind.
+CREATE EXTENSION pg_stat_login;
+CREATE EXTENSION dblink;
+
+ALTER SYSTEM SET pg_stat_login.enable = on;
+SELECT pg_reload_conf();
+SELECT pg_sleep(1);
+
+CREATE ROLE cap_plain LOGIN;
+CREATE DATABASE cap_db1;
+CREATE DATABASE cap_db2;
+
+-- Tries one connection and returns the libpq error, NULL if it connected.
+-- The error keeps only the server message, without the socket path.
+CREATE FUNCTION cap_try_connect(conninfo text) RETURNS text AS $$
+DECLARE
+    detail text;
+BEGIN
+    PERFORM dblink_connect('cap_try', conninfo);
+    PERFORM dblink_disconnect('cap_try');
+    RETURN NULL;
+EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS detail = PG_EXCEPTION_DETAIL;
+    RETURN substring(detail FROM 'FATAL:\s+(.*)$');
+END;
+$$ LANGUAGE plpgsql;
+
+--
+-- several entries: same user in different databases, different users in the
+-- same database, repeated logins and a wrong password
+--
+SELECT pg_stat_login_reset();
+
+SELECT cap_try_connect('dbname=cap_db1 user=cap_plain');
+SELECT cap_try_connect('dbname=cap_db1 user=cap_plain');
+SELECT cap_try_connect('dbname=cap_db2 user=cap_plain');
+SELECT cap_try_connect('dbname=cap_db1 user=tester password=secret123');
+SELECT cap_try_connect('dbname=cap_db1 user=tester password=WRONG');
+SELECT cap_try_connect('dbname=cap_db1 user=tester password=WRONG');
+
+SELECT username, datname, login_ok, login_fail,
+       last_login_ok IS NOT NULL AS has_last_ok,
+       last_login_fail IS NOT NULL AS has_last_fail
+FROM pg_stat_logins
+WHERE datname LIKE 'cap_db%'
+ORDER BY username, datname;
+
+-- The client closes the connection when asked for a password it does not have:
+-- that is not a login attempt, so nothing changes for tester.
+SELECT cap_try_connect('dbname=cap_db1 user=tester');
+
+SELECT username, datname, login_ok, login_fail
+FROM pg_stat_logins
+WHERE username = 'tester' AND datname = 'cap_db1';
+
+-- With trust authentication the hook sees a success even if the session is
+-- rejected afterwards: the role and the database do not exist.
+SELECT cap_try_connect('dbname=cap_db1 user=cap_no_such_role');
+SELECT cap_try_connect('dbname=cap_no_such_db user=cap_plain');
+
+SELECT username, datname, login_ok, login_fail
+FROM pg_stat_logins
+WHERE username = 'cap_no_such_role' OR datname = 'cap_no_such_db'
+ORDER BY username, datname;
+
+--
+-- fill the table: 10000 entries is the maximum, the next ones are dropped.
+-- A connection can find no free slot while the previous backend is exiting,
+-- so those attempts are retried.
+--
+SELECT pg_stat_login_reset();
+
+CREATE PROCEDURE cap_fill(first_id int, last_id int) AS $$
+DECLARE
+    err text;
+BEGIN
+    FOR i IN first_id .. last_id LOOP
+        LOOP
+            err := cap_try_connect(format('dbname=cap_db1 user=cap_user_%s', i));
+            EXIT WHEN err IS DISTINCT FROM 'sorry, too many clients already';
+        END LOOP;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+-- one entry short of the maximum: this session's connections add none
+CALL cap_fill(1, 9999);
+SELECT max_entries, num_entries, n_dropped FROM pg_stat_login_info();
+
+-- the last free slot
+CALL cap_fill(10000, 10000);
+SELECT max_entries, num_entries, n_dropped FROM pg_stat_login_info();
+
+-- new keys are dropped, and each attempt counts in n_dropped
+CALL cap_fill(10001, 10001);
+SELECT max_entries, num_entries, n_dropped FROM pg_stat_login_info();
+CALL cap_fill(10002, 10050);
+SELECT max_entries, num_entries, n_dropped FROM pg_stat_login_info();
+
+SELECT count(*) AS entries_listed FROM pg_stat_logins;
+SELECT count(*) AS dropped_listed FROM pg_stat_logins
+WHERE username IN ('cap_user_10001', 'cap_user_10050');
+
+-- existing keys keep counting with the table full, without dropping anything
+SELECT login_ok FROM pg_stat_logins WHERE username = 'cap_user_1';
+CALL cap_fill(1, 1);
+SELECT login_ok FROM pg_stat_logins WHERE username = 'cap_user_1';
+SELECT max_entries, num_entries, n_dropped FROM pg_stat_login_info();
+
+-- a reset frees the slots and clears n_dropped
+SELECT pg_stat_login_reset();
+SELECT max_entries, num_entries, n_dropped FROM pg_stat_login_info();
+CALL cap_fill(10001, 10001);
+SELECT username, datname, login_ok FROM pg_stat_logins
+WHERE username = 'cap_user_10001';
+SELECT max_entries, num_entries, n_dropped FROM pg_stat_login_info();
+
+--
+-- names in an encoding that is not valid for the database: 32 two-byte
+-- characters are cut in the middle of the last one at NAMEDATALEN - 1 bytes
+--
+CREATE DATABASE cap_utf8 ENCODING 'UTF8' TEMPLATE template0 LOCALE 'C';
+\c cap_utf8
+CREATE EXTENSION pg_stat_login;
+CREATE EXTENSION dblink;
+SELECT pg_stat_login_reset();
+
+DO $$
+BEGIN
+    PERFORM dblink_connect('dbname=cap_utf8 user=' || repeat(chr(241), 32));
+EXCEPTION WHEN OTHERS THEN
+    NULL;
+END;
+$$;
+DO $$
+BEGIN
+    PERFORM dblink_connect('dbname=cap_utf8 user=' || repeat(chr(241), 5));
+EXCEPTION WHEN OTHERS THEN
+    NULL;
+END;
+$$;
+
+-- the non-ASCII bytes of the invalid name are escaped, the valid name is kept
+SELECT username = repeat('\xc3\xb1', 31) || '\xc3' AS escaped,
+       length(upper(username)) AS upper_length
+FROM pg_stat_logins WHERE length(username) > 5;
+SELECT username = repeat(chr(241), 5) AS kept
+FROM pg_stat_logins WHERE length(username) = 5;
+
+\c contrib_regression
+DROP DATABASE cap_utf8;
+
+--
+-- connection slot exhaustion
+--
+SELECT pg_stat_login_reset();
+
+CREATE PROCEDURE cap_hold_connections() AS $$
+DECLARE
+    err text;
+    conninfo text := format('dbname=cap_db2 user=%I', current_user);
+BEGIN
+    FOR i IN 1 .. 100 LOOP
+        BEGIN
+            PERFORM dblink_connect('cap_hold_' || i, conninfo);
+        EXCEPTION WHEN OTHERS THEN
+            GET STACKED DIAGNOSTICS err = PG_EXCEPTION_DETAIL;
+            IF err LIKE '%sorry, too many clients already%' THEN
+                RETURN;
+            END IF;
+            RAISE;
+        END;
+    END LOOP;
+    RAISE EXCEPTION 'connection slots were not exhausted';
+END;
+$$ LANGUAGE plpgsql;
+
+CALL cap_hold_connections();
+
+-- no slot at all: rejected before authentication, so the hook never runs
+SELECT cap_try_connect('dbname=cap_db1 user=cap_plain');
+SELECT cap_try_connect('dbname=cap_db1 user=tester password=secret123');
+SELECT cap_try_connect('dbname=cap_db1 user=tester password=WRONG');
+
+SELECT username, datname, login_ok, login_fail
+FROM pg_stat_logins
+WHERE datname = 'cap_db1';
+
+-- only reserved slots left: a non-superuser is rejected after authentication,
+-- so the hook does run and counts a success
+SELECT dblink_disconnect('cap_hold_1');
+SELECT dblink_disconnect('cap_hold_2');
+SELECT pg_sleep(1);
+
+SELECT cap_try_connect('dbname=cap_db1 user=cap_plain');
+
+SELECT username, datname, login_ok, login_fail
+FROM pg_stat_logins
+WHERE datname = 'cap_db1';
+
+--cleanup
+SELECT count(*) > 0 AS disconnected
+FROM (SELECT dblink_disconnect(c) FROM unnest(dblink_get_connections()) AS c) AS d;
+SELECT pg_sleep(1);
+
+DROP PROCEDURE cap_hold_connections();
+DROP PROCEDURE cap_fill(int, int);
+DROP FUNCTION cap_try_connect(text);
+DROP DATABASE cap_db1;
+DROP DATABASE cap_db2;
+DROP ROLE cap_plain;
+DROP EXTENSION pg_stat_login;
+DROP EXTENSION dblink;

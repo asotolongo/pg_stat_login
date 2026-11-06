@@ -12,7 +12,9 @@
  *
  * Configuration GUCs:
  *   pg_stat_login.enable      - enable/disable collection (default: on)
- *   pg_stat_login.max_entries - max (user, db) pairs tracked (default: 1000)
+ *
+ * The number of (user, db) pairs tracked is fixed at compile time, see
+ * PGSTAT_LOGIN_MAX_ENTRIES.
  *
  * SQL interface:
  *   pg_stat_login()       - login statistics as a set of rows
@@ -24,12 +26,12 @@
  */
 #include "postgres.h"
 
-#include <limits.h>
-
 #include "access/htup_details.h"
 #include "common/hashfn.h"
+#include "common/string.h"
 #include "funcapi.h"
 #include "libpq/auth.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/ipc.h"
@@ -54,8 +56,7 @@ PG_MODULE_MAGIC_EXT(
 #define PGSTAT_KIND_LOGIN          30
 #define PGSTAT_LOGIN_MODULE_NAME   "pg_stat_login"
 #define PGSTAT_LOGIN_TRANCHE_NAME  PGSTAT_LOGIN_MODULE_NAME
-#define PGSTAT_LOGIN_MAX_DEFAULT   1000
-#define PGSTAT_LOGIN_MIN_ENTRIES   100
+#define PGSTAT_LOGIN_MAX_ENTRIES   10000
 
 /*
  * One slot in the open-addressing hash table.
@@ -73,14 +74,20 @@ typedef struct PlsSlot
 } PlsSlot;
 
 /*
- * Stats data block — variable-length header followed by the slot array.
+ * Stats data block — header followed by the slot array.
  * This entire struct is what gets persisted to disk (shared_data_len).
+ *
+ * max_entries is always PGSTAT_LOGIN_MAX_ENTRIES and must not be used as a
+ * bound. It is kept so that stats files written by previous versions with
+ * the same number of entries still load with the same layout.
  */
 typedef struct PlsData
 {
 	int      max_entries;
 	int      num_entries;
-	PlsSlot  entries[FLEXIBLE_ARRAY_MEMBER];
+	TimestampTz stats_reset; /* timestamp of last reset */
+	uint64   n_dropped;      /* events dropped due to full table */
+	PlsSlot  entries[PGSTAT_LOGIN_MAX_ENTRIES];
 } PlsData;
 
 /*
@@ -93,18 +100,11 @@ typedef struct PlsSharedBlock
 {
 	LWLock      lock;        /* protects all writes */
 	uint32      changecount; /* changecount protocol for readers */
-	TimestampTz stats_reset; /* timestamp of last reset */
-	uint64      n_dropped;   /* events dropped due to full table */
-	char        data[FLEXIBLE_ARRAY_MEMBER]; /* holds one PlsData */
+	PlsData     data;
 } PlsSharedBlock;
-
-/* Sizes computed in _PG_init based on max_entries GUC */
-static Size stats_data_size;   /* size of PlsData + slot array */
-static Size shared_block_size; /* size of PlsSharedBlock + PlsData */
 
 /* GUC variables */
 static bool pls_enabled = true;
-static int  pls_max = PGSTAT_LOGIN_MAX_DEFAULT;
 
 /* Saved hook values */
 static ClientAuthentication_hook_type prev_client_auth_hook = NULL;
@@ -120,7 +120,6 @@ PG_FUNCTION_INFO_V1(pg_stat_login_info);
 PG_FUNCTION_INFO_V1(pg_stat_login_reset);
 
 static void pls_init_shmem_cb(void *stats);
-static void pls_init_backend_cb(void);
 static void pls_reset_all_cb(TimestampTz ts);
 static void pls_snapshot_cb(void);
 static void pls_client_auth(Port *port, int status);
@@ -128,12 +127,6 @@ static void pls_shmem_startup(void);
 
 
 /* ---- Helpers ---- */
-
-static inline PlsData *
-pls_get_data(PlsSharedBlock *shmem)
-{
-	return (PlsData *) shmem->data;
-}
 
 /*
  * pls_compute_hash
@@ -160,6 +153,26 @@ pls_compute_hash(const char *username, const char *database)
 }
 
 
+/*
+ * pls_name_get_text
+ *   Convert a stored name to text. Names come from the startup packet without
+ *   any encoding check, and the same entry can be read from databases with
+ *   different encodings, so they are validated here. Invalid names are shown
+ *   with their bytes escaped as \xHH, because they could make the query fail.
+ *   SQL_ASCII accepts any byte, but the output is still checked against the
+ *   client encoding, so non-ASCII names are always escaped there.
+ */
+static Datum
+pls_name_get_text(const char *name)
+{
+	if (GetDatabaseEncoding() != PG_SQL_ASCII &&
+		pg_verifymbstr(name, strlen(name), true))
+		return CStringGetTextDatum(name);
+
+	return CStringGetTextDatum(pg_clean_ascii(name, 0));
+}
+
+
 /* ---- CCS callbacks ---- */
 
 /*
@@ -171,7 +184,6 @@ static void
 pls_init_shmem_cb(void *stats)
 {
 	PlsSharedBlock *shmem = (PlsSharedBlock *) stats;
-	PlsData        *s;
 
 #if PG_VERSION_NUM >= 190000
 	LWLockInitialize(&shmem->lock, LWLockNewTrancheId(PGSTAT_LOGIN_TRANCHE_NAME));
@@ -179,65 +191,36 @@ pls_init_shmem_cb(void *stats)
 	LWLockInitialize(&shmem->lock, LWLockNewTrancheId());
 #endif
 	shmem->changecount = 0;
-	shmem->stats_reset = GetCurrentTimestamp();
-	shmem->n_dropped   = 0;
+	shmem->data.stats_reset = GetCurrentTimestamp();
+	shmem->data.n_dropped   = 0;
 
-	s              = pls_get_data(shmem);
-	s->max_entries = pls_max;
-	s->num_entries = 0;
+	shmem->data.max_entries = PGSTAT_LOGIN_MAX_ENTRIES;
+	shmem->data.num_entries = 0;
 	/* slot array is zeroed at shared memory allocation */
-}
-
-/*
- * pls_init_backend_cb
- *   Runs in every backend after the stats file has been loaded.
- *   Validates that the persisted max_entries matches the current GUC.
- *   If max_entries changed across a clean restart, discards stale data
- *   to prevent out-of-bounds array access.
- */
-static void
-pls_init_backend_cb(void)
-{
-	PlsSharedBlock *shmem = (PlsSharedBlock *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOGIN);
-	PlsData        *s     = pls_get_data(shmem);
-
-	if (s->max_entries == pls_max)
-		return;
-
-	elog(LOG,
-		 "pg_stat_login: discarding persisted stats "
-		 "(max_entries changed from %d to %d)",
-		 s->max_entries, pls_max);
-
-	LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
-	pgstat_begin_changecount_write(&shmem->changecount);
-	s->max_entries = pls_max;
-	s->num_entries = 0;
-	MemSet(s->entries, 0, (Size) pls_max * sizeof(PlsSlot));
-	pgstat_end_changecount_write(&shmem->changecount);
-	shmem->stats_reset = GetCurrentTimestamp();
-	shmem->n_dropped   = 0;
-	LWLockRelease(&shmem->lock);
 }
 
 /*
  * pls_reset_all_cb
  *   Called by pgstat_reset_of_kind(). Zeroes the slot array so that
  *   slots are reclaimed for reuse after a reset.
+ *
+ *   Also called when the core rejects a stats file, possibly after a partial
+ *   load, so the whole block is rewritten without trusting its contents.
  */
 static void
 pls_reset_all_cb(TimestampTz ts)
 {
 	PlsSharedBlock *shmem = (PlsSharedBlock *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOGIN);
-	PlsData        *s     = pls_get_data(shmem);
+	PlsData        *s     = &shmem->data;
 
 	LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
 	pgstat_begin_changecount_write(&shmem->changecount);
-	MemSet(s->entries, 0, (Size) s->max_entries * sizeof(PlsSlot));
+	MemSet(s->entries, 0, sizeof(s->entries));
+	s->max_entries = PGSTAT_LOGIN_MAX_ENTRIES;
 	s->num_entries = 0;
+	s->stats_reset = ts;
+	s->n_dropped   = 0;
 	pgstat_end_changecount_write(&shmem->changecount);
-	shmem->stats_reset = ts;
-	shmem->n_dropped   = 0;
 	LWLockRelease(&shmem->lock);
 }
 
@@ -253,8 +236,8 @@ pls_snapshot_cb(void)
 	PlsData        *snap  = (PlsData *) pgstat_get_custom_snapshot_data(PGSTAT_KIND_LOGIN);
 
 	pgstat_copy_changecounted_stats(snap,
-									pls_get_data(shmem),
-									stats_data_size,
+									&shmem->data,
+									sizeof(PlsData),
 									&shmem->changecount);
 }
 
@@ -310,6 +293,14 @@ pls_client_auth(Port *port, int status)
 	if (!pls_enabled)
 		return;
 
+	/*
+	 * The client closed the connection without completing authentication.
+	 * libpq does this when challenged for a password it hasn't got, and then
+	 * reconnects with one, so this is not a failed login.
+	 */
+	if (status == STATUS_EOF)
+		return;
+
 	/* MyProc is set by InitProcess() before ClientAuthentication() fires */
 	if (!MyProc)
 		return;
@@ -330,18 +321,18 @@ pls_client_auth(Port *port, int status)
 
 	LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
 
-	s   = pls_get_data(shmem);
-	idx = hash % (uint32) s->max_entries;
+	s   = &shmem->data;
+	idx = hash % PGSTAT_LOGIN_MAX_ENTRIES;
 
-	for (probe = 0; probe < s->max_entries; probe++)
+	for (probe = 0; probe < PGSTAT_LOGIN_MAX_ENTRIES; probe++)
 	{
-		uint32   pos  = (idx + (uint32) probe) % (uint32) s->max_entries;
+		uint32   pos  = (idx + (uint32) probe) % PGSTAT_LOGIN_MAX_ENTRIES;
 		PlsSlot *slot = &s->entries[pos];
 
 		if (!slot->used)
 		{
 			/* Empty slot — create a new entry if there is still capacity */
-			if (s->num_entries < s->max_entries)
+			if (s->num_entries < PGSTAT_LOGIN_MAX_ENTRIES)
 			{
 				pgstat_begin_changecount_write(&shmem->changecount);
 				slot->used = true;
@@ -361,7 +352,11 @@ pls_client_auth(Port *port, int status)
 				pgstat_end_changecount_write(&shmem->changecount);
 			}
 			else
-				shmem->n_dropped++;
+			{
+				pgstat_begin_changecount_write(&shmem->changecount);
+				s->n_dropped++;
+				pgstat_end_changecount_write(&shmem->changecount);
+			}
 			break;
 		}
 
@@ -386,8 +381,12 @@ pls_client_auth(Port *port, int status)
 	}
 
 	/* All slots occupied by different keys */
-	if (probe == s->max_entries)
-		shmem->n_dropped++;
+	if (probe == PGSTAT_LOGIN_MAX_ENTRIES)
+	{
+		pgstat_begin_changecount_write(&shmem->changecount);
+		s->n_dropped++;
+		pgstat_end_changecount_write(&shmem->changecount);
+	}
 
 	LWLockRelease(&shmem->lock);
 }
@@ -414,29 +413,7 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
-	/*
-	 * max_entries is PGC_POSTMASTER because it determines the shared memory
-	 * block size which is fixed at postmaster startup.
-	 */
-	DefineCustomIntVariable("pg_stat_login.max_entries",
-							"Maximum number of (user, database) pairs to track.",
-							NULL,
-							&pls_max,
-							PGSTAT_LOGIN_MAX_DEFAULT,
-							PGSTAT_LOGIN_MIN_ENTRIES,
-							INT_MAX / 2,
-							PGC_POSTMASTER,
-							0,
-							NULL,
-							NULL,
-							NULL);
-
 	MarkGUCPrefixReserved("pg_stat_login");
-
-	/* Compute sizes based on the max_entries GUC value */
-	stats_data_size   = offsetof(PlsData, entries) +
-						(Size) pls_max * sizeof(PlsSlot);
-	shared_block_size = offsetof(PlsSharedBlock, data) + stats_data_size;
 
 	/* Fill in the KindInfo descriptor */
 	{
@@ -444,11 +421,10 @@ _PG_init(void)
 			.name            = PGSTAT_LOGIN_MODULE_NAME,
 			.fixed_amount    = true,
 			.write_to_file   = true,
-			.shared_size     = shared_block_size,
+			.shared_size     = sizeof(PlsSharedBlock),
 			.shared_data_off = offsetof(PlsSharedBlock, data),
-			.shared_data_len = stats_data_size,
+			.shared_data_len = sizeof(PlsData),
 			.init_shmem_cb   = pls_init_shmem_cb,
-			.init_backend_cb = pls_init_backend_cb,
 			.reset_all_cb    = pls_reset_all_cb,
 			.snapshot_cb     = pls_snapshot_cb,
 		};
@@ -489,7 +465,7 @@ pg_stat_login(PG_FUNCTION_ARGS)
 
 	InitMaterializedSRF(fcinfo, 0);
 
-	for (i = 0; i < snap->max_entries; i++)
+	for (i = 0; i < PGSTAT_LOGIN_MAX_ENTRIES; i++)
 	{
 		PlsSlot *slot = &snap->entries[i];
 		Datum    values[6];
@@ -498,8 +474,8 @@ pg_stat_login(PG_FUNCTION_ARGS)
 		if (!slot->used)
 			continue;
 
-		values[0] = CStringGetTextDatum(slot->username);
-		values[1] = CStringGetTextDatum(slot->database);
+		values[0] = pls_name_get_text(slot->username);
+		values[1] = pls_name_get_text(slot->database);
 		values[2] = Int64GetDatum(slot->login_ok);
 		values[3] = Int64GetDatum(slot->login_fail);
 
@@ -529,10 +505,8 @@ pg_stat_login_info(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	PlsSharedBlock *shmem;
-	PlsData        *s;
 	Datum           values[4];
 	bool            nulls[4] = {false};
-	int             max_entries;
 	int             num_entries;
 	uint64          n_dropped;
 	TimestampTz     stats_reset;
@@ -540,16 +514,14 @@ pg_stat_login_info(PG_FUNCTION_ARGS)
 	InitMaterializedSRF(fcinfo, 0);
 
 	shmem = (PlsSharedBlock *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOGIN);
-	s     = pls_get_data(shmem);
 
 	LWLockAcquire(&shmem->lock, LW_SHARED);
-	max_entries  = s->max_entries;
-	num_entries  = s->num_entries;
-	n_dropped    = shmem->n_dropped;
-	stats_reset  = shmem->stats_reset;
+	num_entries  = shmem->data.num_entries;
+	n_dropped    = shmem->data.n_dropped;
+	stats_reset  = shmem->data.stats_reset;
 	LWLockRelease(&shmem->lock);
 
-	values[0] = Int32GetDatum(max_entries);
+	values[0] = Int32GetDatum(PGSTAT_LOGIN_MAX_ENTRIES);
 	values[1] = Int32GetDatum(num_entries);
 	values[2] = Int64GetDatum((int64) n_dropped);
 	values[3] = TimestampTzGetDatum(stats_reset);
