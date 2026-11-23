@@ -88,7 +88,7 @@ username | datname  | login_ok | login_fail |         last_login_ok         |   
 
 ```sql
 SELECT username, datname, login_ok, login_fail
-FROM pg_login_stats
+FROM pg_stat_logins
 WHERE login_fail > 0
 ORDER BY login_fail DESC;
 ```
@@ -97,7 +97,7 @@ ORDER BY login_fail DESC;
 
 ```sql
 SELECT username, datname, login_fail
-FROM pg_login_stats
+FROM pg_stat_logins
 WHERE login_ok = 0
 ORDER BY login_fail DESC;
 ```
